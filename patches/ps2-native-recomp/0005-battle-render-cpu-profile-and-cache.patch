@@ -1,0 +1,64 @@
+--- a/runtime/src/gs/gs.cpp
++++ b/runtime/src/gs/gs.cpp
+@@ -51,6 +51,7 @@
+ std::uint32_t g_finish_pending = 0;  // FINISH events that arrived while CSR.FINISH was still set; raised as the game clears the bit
+ std::uint32_t g_finish_queued = 0;   // FINISH writes that came while an earlier one was still on its way; each gets its own event (not in a state)
+ std::uint64_t g_primitives = 0;
++std::uint64_t g_profile_gpu_draw_ns = 0, g_profile_gpu_draw_calls = 0;
+ constexpr std::uint64_t kFinishDelay = 1000; // EE cycles from the FINISH write to CSR.FINISH
+ 
+ #ifdef PS2_GPU
+@@ -898,7 +899,15 @@
+             }
+             if (visible && cpu_raster()) raster::draw(s, vertices, needed);
+ #ifdef PS2_GPU
+-            if (visible && gpu_on()) gpu::draw(s, vertices, needed);
++            if (visible && gpu_on()) {
++                static const bool profile_draw = std::getenv("PS2_RENDER_PROFILE") != nullptr;
++                if (profile_draw) {
++                    const auto begin = std::chrono::steady_clock::now();
++                    gpu::draw(s, vertices, needed);
++                    g_profile_gpu_draw_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count();
++                    ++g_profile_gpu_draw_calls;
++                } else gpu::draw(s, vertices, needed);
++            }
+ #endif
+         }
+         ++g_primitives;
+@@ -1621,6 +1630,12 @@
+                 cpu_at_start = 0;
+             }
+         }
++        if (presented && std::getenv("PS2_RENDER_PROFILE")) {
++            std::fprintf(stderr, "[render-profile] frame %u gpu_draw_cpu_ms %.3f calls %llu\n", h.arg0,
++                         static_cast<double>(g_profile_gpu_draw_ns) / 1e6,
++                         static_cast<unsigned long long>(g_profile_gpu_draw_calls));
++            g_profile_gpu_draw_ns = g_profile_gpu_draw_calls = 0;
++        }
+         queue::render().pop(h);
+         if (presented) {
+             g_presented.fetch_add(1);
+--- a/runtime/src/gs/gpu/gpu.cpp
++++ b/runtime/src/gs/gpu/gpu.cpp
+@@ -3688,6 +3688,10 @@
+     const bool skip_scene_texture = skip_scene_tbp == "*" ||
+         std::find(skip_scene_tbps.begin(), skip_scene_tbps.end(), texture_base) != skip_scene_tbps.end();
+     if (g_scene_geometry && (c.frame & 0x1FFu) == 0x70u && scene_triangle && !skip_scene_texture) {
++        // These are process-level renderer options. Querying the Windows environment
++        // for every triangle costs measurable render-thread time in dense battles.
++        static const bool scene_ps2_lod = os::env("PS2_SCENE_PS2_LOD") == "1";
++        static const bool scene_use_decode = os::env("PS2_SCENE_USE_DECODE") == "1";
+         const bool depth_write = ((c.zbuf >> 32) & 1u) == 0u;
+         const std::uint32_t alpha_test = static_cast<std::uint32_t>((c.test >> 1) & 7u);
+         const bool rgb_only = (c.test & 1u) && alpha_test == 0u && ((c.test >> 12) & 3u) == 3u;
+@@ -3712,8 +3716,8 @@
+                                           (static_cast<std::uint32_t>((c.test >> 14) & 1u) << 24) |
+                                           (static_cast<std::uint32_t>((c.test >> 15) & 1u) << 25) |
+                                           (rgb_mode == 5u ? 1u << 26 : 0u) |
+-                                          (os::env("PS2_SCENE_PS2_LOD") == "1" ? 1u << 27 : 0u) |
+-                                          (os::env("PS2_SCENE_USE_DECODE") == "1" ? 1u << 28 : 0u) |
++                                          (scene_ps2_lod ? 1u << 27 : 0u) |
++                                          (scene_use_decode ? 1u << 28 : 0u) |
+                                           (rgb_mode == 1u || rgb_mode == 2u ? 1u << 29 : 0u) |
+                                           (rgb_mode == 3u || rgb_mode == 4u ? 1u << 30 : 0u) |
+                                           (g_scene_material_debug ? 1u << 31 : 0u);

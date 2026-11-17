@@ -1,0 +1,229 @@
+--- a/runtime/src/gs/gpu/gpu.cpp
++++ b/runtime/src/gs/gpu/gpu.cpp
+@@ -137,7 +137,12 @@
+ WGPUTextureView g_scene_display_view = nullptr;
+ WGPUTexture g_scene_display_depth = nullptr;
+ WGPUTextureView g_scene_display_depth_view = nullptr;
++WGPUTexture g_scene_staged_color = nullptr;
++WGPUTextureView g_scene_staged_view = nullptr;
++WGPUTexture g_scene_staged_depth = nullptr;
++WGPUTextureView g_scene_staged_depth_view = nullptr;
+ bool g_scene_display_ready = false;
++bool g_scene_staged_ready = false;
+ WGPUTexture g_scene_msaa = nullptr;
+ WGPUTextureView g_scene_msaa_view = nullptr;
+ std::uint32_t g_scene_sample_count = 1;
+@@ -146,6 +151,7 @@
+ WGPURenderPipeline g_scene_composite = nullptr;
+ WGPUBindGroupLayout g_scene_composite_layout = nullptr;
+ WGPUBindGroup g_scene_composite_group = nullptr;
++WGPUBindGroup g_scene_staged_composite_group = nullptr;
+ bool g_scene_drawn = false;
+ std::uint64_t g_scene_frame_triangles = 0;
+ WGPUBuffer g_scene_before_hud = nullptr;
+@@ -161,14 +167,20 @@
+ bool g_scene_tiled_battle_effect = false;
+ bool g_scene_red_hex_effect = false;
+ std::uint32_t g_scene_tiled_effect_bounds[2] = {}, g_scene_display_tiled_effect_bounds[2] = {};
++std::uint32_t g_scene_staged_tiled_effect_bounds[2] = {};
+ bool g_scene_dialogue_panel = false;
+ std::uint32_t g_scene_dialogue_bounds[2] = {}, g_scene_display_dialogue_bounds[2] = {};
++std::uint32_t g_scene_staged_dialogue_bounds[2] = {};
+ // The game presents the previous E00 scene from FB0. Keep the matching
+ // E00 snapshots with the delayed scene color targets.
+ WGPUBuffer g_scene_display_final = nullptr;
+ WGPUBuffer g_scene_display_before_hud = nullptr;
+ WGPUBuffer g_scene_display_before_effect = nullptr;
++WGPUBuffer g_scene_staged_final = nullptr;
++WGPUBuffer g_scene_staged_before_hud = nullptr;
++WGPUBuffer g_scene_staged_before_effect = nullptr;
+ std::uint32_t g_scene_display_snapshot_flags = 0;
++std::uint32_t g_scene_staged_snapshot_flags = 0;
+ // PS2_PRESENT_CAPTURE=<path.png> records the actual GPU-presented picture,
+ // including the scene probe, at PS2_PRESENT_CAPTURE_AT=<frame> (default: next).
+ std::string g_present_capture_path;
+@@ -1802,6 +1814,24 @@
+     }
+     wgpuComputePassEncoderEnd(pass);
+     wgpuComputePassEncoderRelease(pass);
++    const auto promote_staged_scene = [&]() {
++        std::swap(g_scene_display_color, g_scene_staged_color);
++        std::swap(g_scene_display_view, g_scene_staged_view);
++        std::swap(g_scene_display_depth, g_scene_staged_depth);
++        std::swap(g_scene_display_depth_view, g_scene_staged_depth_view);
++        std::swap(g_scene_display_final, g_scene_staged_final);
++        std::swap(g_scene_display_before_hud, g_scene_staged_before_hud);
++        std::swap(g_scene_display_before_effect, g_scene_staged_before_effect);
++        std::swap(g_scene_composite_group, g_scene_staged_composite_group);
++        std::swap(g_scene_display_snapshot_flags, g_scene_staged_snapshot_flags);
++        std::swap(g_scene_display_dialogue_bounds, g_scene_staged_dialogue_bounds);
++        std::swap(g_scene_display_tiled_effect_bounds, g_scene_staged_tiled_effect_bounds);
++        g_scene_staged_ready = false;
++        g_scene_display_ready = true;
++    };
++    // With continuous draws, GS presents the prior scene now. A staged scene
++    // from the previous submit is the matching exact view.
++    if (present_view && g_scene_staged_ready && g_scene_drawn) promote_staged_scene();
+     if (g_scene_geometry && g_scene_params) {
+         const std::uint32_t snapshot_flags = g_scene_display_snapshot_flags |
+                                              (g_scene_sample_count == 1 ? 16384u : 0u) |
+@@ -1923,25 +1953,32 @@
+         wgpuRenderPassEncoderEnd(rp);
+         wgpuRenderPassEncoderRelease(rp);
+     }
+-    if (present_view && g_scene_drawn && g_scene_color && g_scene_display_color) {
++    const bool display_only = std::all_of(g_commands.begin(), g_commands.end(),
++                                          [](const Command &command) { return command.pipeline == kDisplay; });
++    // A 30 Hz field scene has a display-only submit between scene draws. Its
++    // GS picture has not advanced yet, so promote the staged exact scene only
++    // after that presentation. The next picture then uses matching views.
++    if (present_view && !g_scene_drawn && display_only && g_scene_staged_ready)
++        promote_staged_scene();
++    if (present_view && g_scene_drawn && g_scene_color && g_scene_staged_color) {
+         WGPUTexelCopyTextureInfo source = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+         source.texture = g_scene_color;
+         WGPUTexelCopyTextureInfo destination = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+-        destination.texture = g_scene_display_color;
++        destination.texture = g_scene_staged_color;
+         const WGPUExtent3D size{g_scene_target_width, g_scene_target_height, 1};
+         wgpuCommandEncoderCopyTextureToTexture(enc, &source, &destination, &size);
+-        if (g_scene_sample_count == 1 && g_scene_depth && g_scene_display_depth) {
++        if (g_scene_sample_count == 1 && g_scene_depth && g_scene_staged_depth) {
+             source.texture = g_scene_depth;
+-            destination.texture = g_scene_display_depth;
++            destination.texture = g_scene_staged_depth;
+             wgpuCommandEncoderCopyTextureToTexture(enc, &source, &destination, &size);
+         }
+         const std::uint64_t snapshot_bytes = bytes_of_vram();
+-        wgpuCommandEncoderCopyBufferToBuffer(enc, g_vram, 0, g_scene_display_final, 0, snapshot_bytes);
++        wgpuCommandEncoderCopyBufferToBuffer(enc, g_vram, 0, g_scene_staged_final, 0, snapshot_bytes);
+         if (g_scene_hud_snapshot)
+-            wgpuCommandEncoderCopyBufferToBuffer(enc, g_scene_before_hud, 0, g_scene_display_before_hud, 0, snapshot_bytes);
++            wgpuCommandEncoderCopyBufferToBuffer(enc, g_scene_before_hud, 0, g_scene_staged_before_hud, 0, snapshot_bytes);
+         if (g_scene_effect_snapshot)
+-            wgpuCommandEncoderCopyBufferToBuffer(enc, g_scene_before_effect, 0, g_scene_display_before_effect, 0, snapshot_bytes);
+-        g_scene_display_snapshot_flags = (g_scene_effect_snapshot ? 1u : 0u) |
++            wgpuCommandEncoderCopyBufferToBuffer(enc, g_scene_before_effect, 0, g_scene_staged_before_effect, 0, snapshot_bytes);
++        g_scene_staged_snapshot_flags = (g_scene_effect_snapshot ? 1u : 0u) |
+                                          (g_scene_hud_snapshot ? 2u : 0u) |
+                                          (g_scene_cinematic_matte == 3u ? 4096u : 0u) |
+                                          (g_scene_screen_fade ? 8192u : 0u) |
+@@ -1950,20 +1987,17 @@
+                                          (g_scene_tiled_postprocess == 0xFFFFu && g_scene_tiled_battle_effect && !g_scene_orb_after_postprocess ? 524288u : 0u) |
+                                          (g_scene_red_hex_effect ? 1048576u : 0u) |
+                                          (g_scene_dialogue_panel ? 262144u : 0u);
+-        g_scene_display_dialogue_bounds[0] = g_scene_dialogue_bounds[0];
+-        g_scene_display_dialogue_bounds[1] = g_scene_dialogue_bounds[1];
+-        g_scene_display_tiled_effect_bounds[0] = g_scene_tiled_effect_bounds[0];
+-        g_scene_display_tiled_effect_bounds[1] = g_scene_tiled_effect_bounds[1];
+-        if (trace_scene_frame) std::fprintf(stderr, "[scene-snapshot] f%llu submit %llu snapshot flags %u scene triangles %llu\n",
++        g_scene_staged_dialogue_bounds[0] = g_scene_dialogue_bounds[0];
++        g_scene_staged_dialogue_bounds[1] = g_scene_dialogue_bounds[1];
++        g_scene_staged_tiled_effect_bounds[0] = g_scene_tiled_effect_bounds[0];
++        g_scene_staged_tiled_effect_bounds[1] = g_scene_tiled_effect_bounds[1];
++        if (trace_scene_frame) std::fprintf(stderr, "[scene-stage] f%llu submit %llu snapshot flags %u scene triangles %llu\n",
+             static_cast<unsigned long long>(frame_count()), static_cast<unsigned long long>(g_submits),
+-            g_scene_display_snapshot_flags, static_cast<unsigned long long>(g_scene_frame_triangles));
+-        g_scene_display_ready = true;
+-    } else if (present_view && std::any_of(g_commands.begin(), g_commands.end(),
+-                                          [](const Command &command) { return command.pipeline != kDisplay; })) {
+-        // Keep the last exact scene when the game only presents its unchanged
+-        // GS buffer (field scenes commonly draw at 30 Hz in a 60 Hz loop).
+-        // Invalidate it when GS work without a new exact scene could have
+-        // cleared or replaced E00, as during an area transition.
++            g_scene_staged_snapshot_flags, static_cast<unsigned long long>(g_scene_frame_triangles));
++        g_scene_staged_ready = true;
++    } else if (present_view && !display_only) {
++        // GS work without matching exact triangles may clear or replace E00.
++        g_scene_staged_ready = false;
+         g_scene_display_ready = false;
+     }
+     if (g_present_capture_now && g_present_capture_texture) {
+@@ -4066,12 +4100,17 @@
+     g_scene_target_width = g_scene_grid_scale ? 512u * g_scene_grid_scale : std::max(g_surface_width, 1u);
+     g_scene_target_height = g_scene_grid_scale ? 448u * g_scene_grid_scale : std::max(g_surface_height, 1u);
+     if (g_scene_composite_group) wgpuBindGroupRelease(g_scene_composite_group), g_scene_composite_group = nullptr;
++    if (g_scene_staged_composite_group) wgpuBindGroupRelease(g_scene_staged_composite_group), g_scene_staged_composite_group = nullptr;
+     if (g_scene_color_view) wgpuTextureViewRelease(g_scene_color_view), g_scene_color_view = nullptr;
+     if (g_scene_color) wgpuTextureRelease(g_scene_color), g_scene_color = nullptr;
+     if (g_scene_display_view) wgpuTextureViewRelease(g_scene_display_view), g_scene_display_view = nullptr;
+     if (g_scene_display_color) wgpuTextureRelease(g_scene_display_color), g_scene_display_color = nullptr;
+     if (g_scene_display_depth_view) wgpuTextureViewRelease(g_scene_display_depth_view), g_scene_display_depth_view = nullptr;
+     if (g_scene_display_depth) wgpuTextureRelease(g_scene_display_depth), g_scene_display_depth = nullptr;
++    if (g_scene_staged_view) wgpuTextureViewRelease(g_scene_staged_view), g_scene_staged_view = nullptr;
++    if (g_scene_staged_color) wgpuTextureRelease(g_scene_staged_color), g_scene_staged_color = nullptr;
++    if (g_scene_staged_depth_view) wgpuTextureViewRelease(g_scene_staged_depth_view), g_scene_staged_depth_view = nullptr;
++    if (g_scene_staged_depth) wgpuTextureRelease(g_scene_staged_depth), g_scene_staged_depth = nullptr;
+     if (g_scene_msaa_view) wgpuTextureViewRelease(g_scene_msaa_view), g_scene_msaa_view = nullptr;
+     if (g_scene_msaa) wgpuTextureRelease(g_scene_msaa), g_scene_msaa = nullptr;
+     if (g_scene_depth_view) wgpuTextureViewRelease(g_scene_depth_view), g_scene_depth_view = nullptr;
+@@ -4089,6 +4128,8 @@
+     d.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+     g_scene_display_depth = wgpuDeviceCreateTexture(g_device, &d);
+     if (g_scene_display_depth) g_scene_display_depth_view = wgpuTextureCreateView(g_scene_display_depth, nullptr);
++    g_scene_staged_depth = wgpuDeviceCreateTexture(g_device, &d);
++    if (g_scene_staged_depth) g_scene_staged_depth_view = wgpuTextureCreateView(g_scene_staged_depth, nullptr);
+     if (g_scene_sample_count > 1) {
+         d.sampleCount = g_scene_sample_count;
+         d.format = g_surface_format;
+@@ -4104,7 +4145,10 @@
+     d.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+     g_scene_display_color = wgpuDeviceCreateTexture(g_device, &d);
+     if (g_scene_display_color) g_scene_display_view = wgpuTextureCreateView(g_scene_display_color, nullptr);
+-    if (g_scene_display_view && g_scene_display_depth_view && g_scene_composite_layout) {
++    g_scene_staged_color = wgpuDeviceCreateTexture(g_device, &d);
++    if (g_scene_staged_color) g_scene_staged_view = wgpuTextureCreateView(g_scene_staged_color, nullptr);
++    if (g_scene_display_view && g_scene_display_depth_view && g_scene_staged_view &&
++        g_scene_staged_depth_view && g_scene_composite_layout) {
+         WGPUBindGroupEntry entries[7] = {};
+         for (int i = 0; i < 7; ++i) {
+             entries[i] = WGPU_BIND_GROUP_ENTRY_INIT;
+@@ -4122,10 +4166,18 @@
+         desc.entryCount = 7;
+         desc.entries = entries;
+         g_scene_composite_group = wgpuDeviceCreateBindGroup(g_device, &desc);
++        entries[0].textureView = g_scene_staged_view;
++        entries[1].buffer = g_scene_staged_final;
++        entries[2].buffer = g_scene_staged_before_hud;
++        entries[3].buffer = g_scene_staged_before_effect;
++        entries[6].textureView = g_scene_staged_depth_view;
++        g_scene_staged_composite_group = wgpuDeviceCreateBindGroup(g_device, &desc);
+     }
+     g_scene_drawn = false;
+     g_scene_display_ready = false;
++    g_scene_staged_ready = false;
+     g_scene_display_snapshot_flags = 0;
++    g_scene_staged_snapshot_flags = 0;
+     g_scene_cinematic_matte = 0;
+     g_scene_screen_fade = false;
+     g_scene_logo_overlay = false;
+@@ -4682,6 +4734,9 @@
+     g_scene_display_final = make_buffer(bytes_of_vram(), WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+     g_scene_display_before_hud = make_buffer(bytes_of_vram(), WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+     g_scene_display_before_effect = make_buffer(bytes_of_vram(), WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
++    g_scene_staged_final = make_buffer(bytes_of_vram(), WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
++    g_scene_staged_before_hud = make_buffer(bytes_of_vram(), WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
++    g_scene_staged_before_effect = make_buffer(bytes_of_vram(), WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+     rebuild_scene_group();
+     resize_scene_depth();
+     std::fprintf(stderr, "[scene-probe] textured triangle probe enabled (PS2_SCENE_GEOMETRY=1, grid scale %u)\n",
+@@ -4689,6 +4744,9 @@
+     return g_scene_depth_view != nullptr && g_scene_color_view != nullptr && g_scene_display_view != nullptr &&
+            g_scene_display_final != nullptr && g_scene_display_before_hud != nullptr &&
+            g_scene_display_before_effect != nullptr && g_scene_composite_group != nullptr &&
++           g_scene_staged_view != nullptr && g_scene_staged_depth_view != nullptr &&
++           g_scene_staged_final != nullptr && g_scene_staged_before_hud != nullptr &&
++           g_scene_staged_before_effect != nullptr && g_scene_staged_composite_group != nullptr &&
+            (g_scene_sample_count == 1 || g_scene_msaa_view != nullptr);
+ }
+ 
+@@ -5016,7 +5074,8 @@
+         if (st.texture) wgpuTextureRelease(st.texture);
+         submit();  // the chip still gets the work; only the screen misses this picture
+         g_scene_drawn = false;
+-            g_scene_hud_snapshot = false;
++        g_scene_staged_ready = false;
++        g_scene_hud_snapshot = false;
+         g_scene_effect_snapshot = false;
+         g_scene_fullscreen_effect = false;
+         g_scene_cinematic_matte = 0;

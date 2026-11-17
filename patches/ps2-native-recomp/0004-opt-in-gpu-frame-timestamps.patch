@@ -1,0 +1,85 @@
+--- a/runtime/src/gs/gpu/gpu.cpp
++++ b/runtime/src/gs/gpu/gpu.cpp
+@@ -201,6 +201,8 @@
+ WGPUBuffer g_query_resolve = nullptr, g_query_read = nullptr;
+ bool g_query_pending = false, g_query_ready = false;
+ std::uint64_t g_measured_ns = 0, g_measured = 0, g_total_passes = 0;
++std::FILE *g_gpu_frame_log = nullptr;  // PS2_GPU_FRAME_LOG: full command-buffer timestamp samples
++std::uint64_t g_query_frame = 0;
+ WGPUDevice g_device = nullptr;
+ WGPUQueue g_queue = nullptr;
+ WGPUBuffer g_vram = nullptr, g_tables = nullptr, g_params = nullptr, g_data = nullptr, g_clut = nullptr, g_scratch = nullptr, g_readback = nullptr, g_decoded = nullptr;
+@@ -1610,6 +1612,11 @@
+             if (t[1] > t[0]) {
+                 g_measured_ns += t[1] - t[0];
+                 ++g_measured;
++                if (g_gpu_frame_log) {
++                    std::fprintf(g_gpu_frame_log, "%llu %.6f\n", static_cast<unsigned long long>(g_query_frame),
++                                 static_cast<double>(t[1] - t[0]) / 1e6);
++                    std::fflush(g_gpu_frame_log);
++                }
+             }
+         }
+         wgpuBufferUnmap(g_query_read);
+@@ -1619,12 +1626,16 @@
+         && !card_work
+         ;
+     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
++    if (measure && g_gpu_frame_log) {
++        g_query_frame = frame_count();
++        wgpuCommandEncoderWriteTimestamp(enc, g_queries, 0);
++    }
+     WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
+     writes.querySet = g_queries;
+     writes.beginningOfPassWriteIndex = 0;
+     writes.endOfPassWriteIndex = 1;
+     WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+-    if (measure) cd.timestampWrites = &writes;
++    if (measure && !g_gpu_frame_log) cd.timestampWrites = &writes;
+     WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
+     Pipeline current = kPipelines;
+     bool current_mip = false;
+@@ -1812,7 +1823,7 @@
+         wgpuQueueWriteBuffer(g_queue, g_scene_params, 32, g_scene_display_tiled_effect_bounds, sizeof g_scene_display_tiled_effect_bounds);
+     }
+     if (card_work) hw::live_encode(enc, ~0u);
+-    if (measure) {
++    if (measure && !g_gpu_frame_log) {
+         wgpuCommandEncoderResolveQuerySet(enc, g_queries, 0, 2, g_query_resolve, 0);
+         wgpuCommandEncoderCopyBufferToBuffer(enc, g_query_resolve, 0, g_query_read, 0, 16);
+     }
+@@ -1963,6 +1974,11 @@
+         destination.layout.rowsPerImage = g_surface_height;
+         const WGPUExtent3D size{g_surface_width, g_surface_height, 1};
+         wgpuCommandEncoderCopyTextureToBuffer(enc, &source, &destination, &size);
++    }
++    if (measure && g_gpu_frame_log) {
++        wgpuCommandEncoderWriteTimestamp(enc, g_queries, 1);
++        wgpuCommandEncoderResolveQuerySet(enc, g_queries, 0, 2, g_query_resolve, 0);
++        wgpuCommandEncoderCopyBufferToBuffer(enc, g_query_resolve, 0, g_query_read, 0, 16);
+     }
+     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
+     wgpuQueueSubmit(g_queue, 1, &cmd);
+@@ -2982,9 +2998,21 @@
+     limits.maxBufferSize = supported.maxBufferSize;
+     WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
+     dd.requiredLimits = &limits;
+-    WGPUFeatureName features[2];
++    WGPUFeatureName features[3];
+     g_timestamps = wgpuAdapterHasFeature(adapter, WGPUFeatureName_TimestampQuery);
++    const auto encoder_timestamps = static_cast<WGPUFeatureName>(WGPUNativeFeature_TimestampQueryInsideEncoders);
++    const bool can_log_gpu_frames = g_timestamps && wgpuAdapterHasFeature(adapter, encoder_timestamps);
++    if (const std::string path = os::env("PS2_GPU_FRAME_LOG"); !path.empty()) {
++        if (can_log_gpu_frames) {
++            g_gpu_frame_log = os::open(path.c_str(), "w");
++            if (g_gpu_frame_log) std::fprintf(g_gpu_frame_log, "frame gpu_submit_ms\n");
++            else std::fprintf(stderr, "[gpu-frame] cannot open %s\n", path.c_str());
++        } else {
++            std::fprintf(stderr, "[gpu-frame] adapter has no encoder timestamp-query support\n");
++        }
++    }
+     if (g_timestamps) features[dd.requiredFeatureCount++] = WGPUFeatureName_TimestampQuery;
++    if (g_gpu_frame_log) features[dd.requiredFeatureCount++] = encoder_timestamps;
+     if (hw::enabled() && wgpuAdapterHasFeature(adapter, WGPUFeatureName_DualSourceBlending)) features[dd.requiredFeatureCount++] = WGPUFeatureName_DualSourceBlending;  // stored alpha in one draw; asked for only when the card path is on and the adapter offers it
+     dd.requiredFeatures = features;
+     dd.uncapturedErrorCallbackInfo.callback = on_error;

@@ -1,0 +1,19 @@
+--- a/runtime/src/gs/gpu/gpu.cpp
++++ b/runtime/src/gs/gpu/gpu.cpp
+@@ -1958,10 +1958,12 @@
+             static_cast<unsigned long long>(frame_count()), static_cast<unsigned long long>(g_submits),
+             g_scene_display_snapshot_flags, static_cast<unsigned long long>(g_scene_frame_triangles));
+         g_scene_display_ready = true;
+-    } else if (present_view) {
+-        // Area transitions can present a cleared E00 without issuing any
+-        // scene triangles. The prior frame's exact scene must not survive
+-        // over that black GS frame.
++    } else if (present_view && std::any_of(g_commands.begin(), g_commands.end(),
++                                          [](const Command &command) { return command.pipeline != kDisplay; })) {
++        // Keep the last exact scene when the game only presents its unchanged
++        // GS buffer (field scenes commonly draw at 30 Hz in a 60 Hz loop).
++        // Invalidate it when GS work without a new exact scene could have
++        // cleared or replaced E00, as during an area transition.
+         g_scene_display_ready = false;
+     }
+     if (g_present_capture_now && g_present_capture_texture) {

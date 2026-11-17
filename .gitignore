@@ -1,0 +1,26 @@
+# Private game material and generated outputs
+/work/
+/build/
+/games/
+/disc_extract/
+/external/
+/analysis/
+/ROADMAP.md
+*.iso
+*.chd
+*.cso
+*.zso
+*.bin
+*.elf
+*.ps2
+*.state
+*.p2s
+*.sav
+*.zip
+*.7z
+*.ghidra
+*.rep
+
+# Python scratch files
+__pycache__/
+*.pyc

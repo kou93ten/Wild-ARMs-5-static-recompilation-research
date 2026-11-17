@@ -1,0 +1,26 @@
+diff --git a/runtime/src/dispatch.cpp b/runtime/src/dispatch.cpp
+index ed357db..e5a8de8 100644
+--- a/runtime/src/dispatch.cpp
++++ b/runtime/src/dispatch.cpp
+@@ -93,6 +93,21 @@ const UnitInfo *module_unit(const ModuleInfo &m, std::uint32_t offset) {
+ std::uint16_t module_entry(const Instance &i, std::uint32_t pc, const UnitInfo *&unit) {
+     unit = module_unit(*i.module, pc - i.base);
+     const std::uint16_t entry = unit ? unit->entries[(pc - i.base - unit->base) >> 2] : 0;
++    // A cached fixed-base window may have been rewritten since its last spot
++    // check. Validate the requested entry before running code from that image.
++    if (entry && i.module->fixed_base) {
++        for (std::uint32_t byte = 0; byte < 16 && pc - i.base + byte < i.module->size; byte += 4) {
++            const std::uint32_t offset = pc - i.base + byte;
++            std::uint32_t lo = 0, hi = i.module->check_count;
++            while (lo < hi) {
++                const std::uint32_t mid = lo + (hi - lo) / 2;
++                if (i.module->checks[2 * mid] < offset) lo = mid + 1;
++                else hi = mid;
++            }
++            if (lo < i.module->check_count && i.module->checks[2 * lo] == offset &&
++                ld32(pc + byte) != i.module->checks[2 * lo + 1]) return 0;
++        }
++    }
+     if (entry && i.soft) {
+         // An entry that only a guess found: it is served while its own first words are what was translated.
+         if (const auto at = i.soft->groups.find(pc - i.base); at != i.soft->groups.end()) {

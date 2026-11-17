@@ -1,0 +1,38 @@
+--- a/runtime/src/gs/gpu/gpu.cpp
++++ b/runtime/src/gs/gpu/gpu.cpp
+@@ -3589,19 +3589,26 @@
+         texture_base == 0x3B00u && ((c.tex0 >> 20) & 0x3Fu) == 0x13u &&
+         ((c.tex0 >> 26) & 0xFu) == 6u)
+         g_scene_orb_after_postprocess = true;
+-    // Battle's offscreen strip copy also feeds a small cluster of translucent
+-    // light quads. Track their actual bounds so the compositor can retain the
+-    // GS blur only where it is brighter than the native scene.
+-    if (g_scene_geometry && g_scene_tiled_postprocess == 0xFFFFu && scene_triangle &&
++    // Battle's offscreen strip copy blurs translucent lights. The 3A40
++    // enemy material is drawn before the copy; 3C80 light quads follow it.
++    // Track their actual bounds and retain only the brighter GS blur there.
++    // Small distant 3A40 particles do not need this larger halo.
++    const bool enemy_glow = g_scene_geometry && scene_triangle &&
++        texture_base == 0x3A40u && ((c.tex0 >> 20) & 0x3Fu) == 0x13u &&
++        (attr & 0x40u) && (static_cast<std::uint32_t>(c.alpha) & 0xFFu) == 0x68u &&
++        ((c.alpha >> 32) & 0xFFu) == 0x59u && maxx - minx >= 7;
++    const bool battle_light = g_scene_geometry && g_scene_tiled_postprocess == 0xFFFFu && scene_triangle &&
+         texture_base == 0x3C80u && ((c.tex0 >> 20) & 0x3Fu) == 0x13u &&
+         ((c.tex0 >> 26) & 0xFu) == 7u && (attr & 0x40u) &&
+         (static_cast<std::uint32_t>(c.alpha) & 0xFFu) == 0x68u &&
+         ((c.alpha >> 32) & 0xFFu) == 0x80u &&
+-        v[0].r <= 16u && v[0].g <= 32u && v[0].b <= 32u) {
+-        const std::uint32_t x0 = static_cast<std::uint32_t>(std::clamp(minx - 2, 0, 511));
+-        const std::uint32_t y0 = static_cast<std::uint32_t>(std::clamp(miny - 2, 0, 447));
+-        const std::uint32_t x1 = static_cast<std::uint32_t>(std::clamp(maxx + 3, 0, 512));
+-        const std::uint32_t y1 = static_cast<std::uint32_t>(std::clamp(maxy + 3, 0, 448));
++        v[0].r <= 16u && v[0].g <= 32u && v[0].b <= 32u;
++    if (enemy_glow || battle_light) {
++        const int padding = enemy_glow ? 24 : 2;
++        const std::uint32_t x0 = static_cast<std::uint32_t>(std::clamp(minx - padding, 0, 511));
++        const std::uint32_t y0 = static_cast<std::uint32_t>(std::clamp(miny - padding, 0, 447));
++        const std::uint32_t x1 = static_cast<std::uint32_t>(std::clamp(maxx + padding + 1, 0, 512));
++        const std::uint32_t y1 = static_cast<std::uint32_t>(std::clamp(maxy + padding + 1, 0, 448));
+         if (!g_scene_tiled_battle_effect) {
+             g_scene_tiled_effect_bounds[0] = x0 | (y0 << 16);
+             g_scene_tiled_effect_bounds[1] = x1 | (y1 << 16);

@@ -1,0 +1,207 @@
+diff --git a/runtime/src/ee_live.cpp b/runtime/src/ee_live.cpp
+index 9ee500c..5219d4b 100644
+--- a/runtime/src/ee_live.cpp
++++ b/runtime/src/ee_live.cpp
+@@ -226,7 +226,7 @@ std::vector<std::uint8_t> read_file(const fs::path &p) {
+ // The captured windows in overlays\ are bounded, because the next build of the game translates every one of them. A window whose
+ // code shares its memory with data that keeps changing (Tekken 5 at 0x00488000: the loaded game's own tables) gets a new name, the
+ // CRC-32 of its content, at nearly every miss, and 1400 images of 256 KiB (374 MB) were written in a few runs. The rules:
+-//  - an image that differs from one already there in at most 1/16 of its words is the same code with other data: that image stands
++//  - an image that differs from one already there in at most 1/16 of the words in each code unit is the same code with other data: that image stands
+ //    for it (and is marked as just used), nothing is written, and the entry points go under the name of the one that is kept;
+ //  - at most kOverlaysPerBase images per window address, kOverlaysTotal in all, kOverlayBytes together. Past a limit the images
+ //    used least recently (by the time of the file) go: the folder keeps what the latest plays needed.
+@@ -269,13 +269,18 @@ std::vector<SavedOverlay> list_overlays(const fs::path &dir) {
+     return all;
+ }
+ 
+-// The same code with other data: at most 1/16 of the words differ (a different length counts as different words).
++// Compare each code unit separately so unchanged tail units cannot hide rewritten code at the entry.
+ bool near_duplicate(const std::vector<std::uint8_t> &a, const std::vector<std::uint8_t> &b) {
+-    const std::size_t common = std::min(a.size(), b.size()) / 4, longest = std::max(a.size(), b.size()) / 4;
+-    std::size_t different = longest - common;
+-    for (std::size_t i = 0; i < common && different * 16 <= longest; ++i)
+-        if (std::memcmp(a.data() + i * 4, b.data() + i * 4, 4) != 0) ++different;
+-    return different * 16 <= longest;
++    for (std::size_t at = 0; at < std::max(a.size(), b.size()); at += recomp::kWindowUnit) {
++        const std::size_t words_a = at < a.size() ? std::min<std::size_t>(recomp::kWindowUnit, a.size() - at) / 4 : 0;
++        const std::size_t words_b = at < b.size() ? std::min<std::size_t>(recomp::kWindowUnit, b.size() - at) / 4 : 0;
++        const std::size_t common = std::min(words_a, words_b), longest = std::max(words_a, words_b);
++        std::size_t different = longest - common;
++        for (std::size_t i = 0; i < common && different * 16 <= longest; ++i)
++            if (std::memcmp(a.data() + at + i * 4, b.data() + at + i * 4, 4) != 0) ++different;
++        if (different * 16 > longest) return false;
++    }
++    return true;
+ }
+ 
+ // Removes the images past the limits, least recently used first; `keep` is never removed.
+@@ -311,7 +316,8 @@ void trim_overlays(std::vector<SavedOverlay> all, const std::string &keep) {
+ }
+ 
+ // Saves a captured window image, or finds the saved one that stands for it; returns the name it is saved under.
+-std::string save_overlay(const fs::path &dir, const std::string &name, std::uint32_t base, const std::vector<std::uint8_t> &image) {
++std::string save_overlay(const fs::path &dir, const std::string &name, std::uint32_t base,
++                         const std::vector<std::uint8_t> &image, const std::vector<std::uint32_t> &entries) {
+     std::error_code error;
+     const auto touch = [&](const fs::path &f) { fs::last_write_time(f, fs::file_time_type::clock::now(), error); };
+     const fs::path file = dir / (name + ".bin");
+@@ -324,11 +330,22 @@ std::string save_overlay(const fs::path &dir, const std::string &name, std::uint
+     for (const SavedOverlay &o : all)
+         if (o.base == base) same_base.push_back(&o);
+     std::sort(same_base.begin(), same_base.end(), [](const SavedOverlay *a, const SavedOverlay *b) { return a->time > b->time; });
+-    for (const SavedOverlay *o : same_base)
+-        if (o->size >= image.size() / 2 && o->size <= image.size() * 2 && near_duplicate(read_file(o->file), image)) {
++    for (const SavedOverlay *o : same_base) {
++        if (o->size < image.size() / 2 || o->size > image.size() * 2) continue;
++        const auto saved = read_file(o->file);
++        bool same_entries = true;
++        for (const std::uint32_t entry : entries) {
++            const std::size_t at = entry - base;
++            if (at + 16 > std::min(saved.size(), image.size()) || std::memcmp(saved.data() + at, image.data() + at, 16) != 0) {
++                same_entries = false;
++                break;
++            }
++        }
++        if (same_entries && near_duplicate(saved, image)) {
+             touch(o->file);
+             return o->name;
+         }
++    }
+     {
+         std::ofstream out(file, std::ios::binary);
+         out.write(reinterpret_cast<const char *>(image.data()), static_cast<std::streamsize>(image.size()));
+@@ -355,7 +372,7 @@ void remember(const std::string &name, std::uint32_t base, const std::vector<std
+     if (!program && fs::is_directory(overlays, error)) {
+         const auto it = g->overlay_kept.find(name);
+         if (it != g->overlay_kept.end()) kept = it->second;
+-        else g->overlay_kept[name] = kept = save_overlay(overlays, name, base, image);
++        else g->overlay_kept[name] = kept = save_overlay(overlays, name, base, image, entries);
+     }
+     const fs::path entries_file = g->game_dir / "entries.txt";
+     if (fs::is_regular_file(entries_file, error)) {
+diff --git a/scripts/windows.py b/scripts/windows.py
+index 6c4ba1b..83037e4 100644
+--- a/scripts/windows.py
++++ b/scripts/windows.py
+@@ -24,8 +24,8 @@ exactly the image the game was running when it called the missing entry.
+ The folder is bounded, because the build translates every image in it (a window
+ that shares its memory with changing data gets a new name, the CRC, every time:
+ Tekken 5 wrote 374 MB in a few runs). The same rules as runtime/src/ee_live.cpp:
+-an image that differs from a saved one at the same address in at most 1/16 of its
+-words is the same code with other data and is not saved again; at most 8 images
++an image that differs from a saved one at the same address in at most 1/16 of the
++words in each 16 KiB unit is the same code with other data and is not saved again; at most 8 images
+ per address, 32 in all, 16 MiB together, the least recently used go first. Only
+ names of the form <8 hex>_<8 hex>.bin are managed.
+ """
+@@ -86,17 +86,40 @@ def saved_images(folder):
+ 
+ 
+ def near_duplicate(a, b):
+-    """The same code with other data: at most 1/16 of the words differ (a different length counts as different words)."""
+-    common, longest = min(len(a), len(b)) // 4, max(len(a), len(b)) // 4
+-    wa, wb = memoryview(a[:common * 4]).cast('I'), memoryview(b[:common * 4]).cast('I')
+-    different = longest - common + sum(1 for x, y in zip(wa, wb) if x != y)
+-    return different * 16 <= longest
+-
+-
+-def similar_saved(images, base, blob):
++    """Treat each code unit separately so unchanged tail units cannot hide a rewritten first unit."""
++    for at in range(0, max(len(a), len(b)), UNIT):
++        wa = memoryview(a[at:at + UNIT]).cast('I')
++        wb = memoryview(b[at:at + UNIT]).cast('I')
++        different = abs(len(wa) - len(wb)) + sum(x != y for x, y in zip(wa, wb))
++        if different * 16 > max(len(wa), len(wb)):
++            return False
++    return True
++
++
++def same_entries(saved, blob, entry_offsets):
++    """A requested instruction entry must not change when two images are combined."""
++    return all(at + 16 <= min(len(saved), len(blob)) and saved[at:at + 16] == blob[at:at + 16]
++               for at in entry_offsets)
++
++
++def missed_offset(token, base, size):
++    if ':' in token:
++        name, at = token.split(':', 1)
++        if not NAME.match(name + '.bin') or int(name[:8], 16) != base:
++            return None
++        offset = int(at, 16)
++    else:
++        offset = int(token, 16) - base
++    return offset if 0 <= offset < size else None
++
++
++def similar_saved(images, base, blob, entry_offsets=()):
+     """The newest saved image at this address that stands for blob, or None."""
+     for name, b, size, _, path in images:
+-        if b == base and len(blob) // 2 <= size <= len(blob) * 2 and near_duplicate(open(path, 'rb').read(), blob):
++        if b != base or not len(blob) // 2 <= size <= len(blob) * 2:
++            continue
++        saved = open(path, 'rb').read()
++        if near_duplicate(saved, blob) and same_entries(saved, blob, entry_offsets):
+             return name, path
+     return None
+ 
+@@ -116,10 +139,16 @@ def trim(folder, entries=None, keep=None):
+             kept.append(o)
+         else:
+             removed.append(o)
++    required = {}
++    if entries and os.path.isfile(entries):
++        for token in open(entries).read().split():
++            name, colon, at = token.partition(':')
++            if colon and NAME.match(name + '.bin'):
++                required.setdefault(name, []).append(int(at, 16))
+     stand_in = {}
+     for o in removed:
+         blob = open(o[4], 'rb').read()
+-        hit = similar_saved(kept, o[1], blob)
++        hit = similar_saved(kept, o[1], blob, required.get(o[0], ()))
+         if hit:
+             stand_in[o[0]] = hit[0]
+     for o in removed:
+@@ -177,13 +206,15 @@ def main() -> None:
+         blob = dump[base:base + size]
+         if not any(blob):
+             continue
++        missed = open(misses).read().split() if misses and os.path.exists(misses) else []
++        entry_offsets = [at for token in missed if (at := missed_offset(token, base, size)) is not None]
+         crc = binascii.crc32(blob) & 0xFFFFFFFF
+         stem = '%08X_%08X' % (base, crc)
+         path = os.path.join(outdir, stem + '.bin')
+         if os.path.exists(path):
+             os.utime(path)                # used again: the newest
+         else:
+-            hit = similar_saved(saved_images(outdir), base, blob)
++            hit = similar_saved(saved_images(outdir), base, blob, entry_offsets)
+             if hit:
+                 stem, path = hit          # the same code with other data is saved already
+                 os.utime(path)
+@@ -195,17 +226,15 @@ def main() -> None:
+                 if removed:
+                     print('dropped %d images past the limits' % removed)
+         if misses and os.path.exists(misses) and os.path.exists(path):
+-            lines = open(misses).read().split()
++            lines = missed
+             names = {}
+-            for k, token in enumerate(lines):
+-                if ':' in token:
+-                    continue
+-                pc = int(token, 16)
+-                if base <= pc < base + size:
+-                    names[token] = '%s:%x' % (stem, pc - base)
++            for token in lines:
++                at = missed_offset(token, base, size)
++                if at is not None:
++                    names[token] = '%s:%x' % (stem, at)
+             if names:
+                 open(misses, 'w', newline='\n').write('\n'.join(names.get(t, t) for t in lines) + '\n')
+ 
+ 
+ if __name__ == '__main__':
+-    main()
+\ No newline at end of file
++    main()

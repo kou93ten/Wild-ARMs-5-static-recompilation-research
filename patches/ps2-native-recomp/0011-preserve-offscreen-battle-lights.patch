@@ -1,0 +1,150 @@
+--- a/runtime/src/gs/gpu/gpu.cpp
++++ b/runtime/src/gs/gpu/gpu.cpp
+@@ -165,6 +165,7 @@
+ std::uint32_t g_scene_tiled_postprocess = 0;
+ bool g_scene_orb_after_postprocess = false;
+ bool g_scene_tiled_battle_effect = false;
++bool g_scene_offscreen_light = false;
+ bool g_scene_red_hex_effect = false;
+ std::uint32_t g_scene_tiled_effect_bounds[2] = {}, g_scene_display_tiled_effect_bounds[2] = {};
+ std::uint32_t g_scene_staged_tiled_effect_bounds[2] = {};
+@@ -1765,7 +1766,7 @@
+         const bool fullscreen_command = fullscreen_command_index < g_scene_fullscreen_commands.size() &&
+                                         g_scene_fullscreen_commands[fullscreen_command_index] == this_command;
+         if (!g_scene_hud_snapshot && g_scene_before_hud &&
+-            (hud_command || compass_command || (effect_command && g_scene_fullscreen_effect))) {
++            (hud_command || compass_command || (effect_command && g_scene_fullscreen_effect && !g_scene_offscreen_light))) {
+             wgpuComputePassEncoderEnd(pass);
+             wgpuComputePassEncoderRelease(pass);
+             wgpuCommandEncoderCopyBufferToBuffer(enc, g_vram, 0, g_scene_before_hud, 0, bytes_of_vram());
+@@ -1978,13 +1979,15 @@
+             wgpuCommandEncoderCopyBufferToBuffer(enc, g_scene_before_hud, 0, g_scene_staged_before_hud, 0, snapshot_bytes);
+         if (g_scene_effect_snapshot)
+             wgpuCommandEncoderCopyBufferToBuffer(enc, g_scene_before_effect, 0, g_scene_staged_before_effect, 0, snapshot_bytes);
+-        g_scene_staged_snapshot_flags = (g_scene_effect_snapshot ? 1u : 0u) |
++        g_scene_staged_snapshot_flags = (g_scene_effect_snapshot &&
++                                         (!g_scene_offscreen_light || g_scene_tiled_postprocess == 0xFFFFu) ? 1u : 0u) |
+                                          (g_scene_hud_snapshot ? 2u : 0u) |
+                                          (g_scene_cinematic_matte == 3u ? 4096u : 0u) |
+                                          (g_scene_screen_fade ? 8192u : 0u) |
+                                          (g_scene_logo_overlay ? 65536u : 0u) |
+                                          (g_scene_tiled_postprocess == 0xFFFFu && g_scene_orb_after_postprocess ? 131072u : 0u) |
+                                          (g_scene_tiled_postprocess == 0xFFFFu && g_scene_tiled_battle_effect && !g_scene_orb_after_postprocess ? 524288u : 0u) |
++                                         (g_scene_tiled_postprocess == 0xFFFFu && g_scene_offscreen_light && !g_scene_orb_after_postprocess ? 2097152u : 0u) |
+                                          (g_scene_red_hex_effect ? 1048576u : 0u) |
+                                          (g_scene_dialogue_panel ? 262144u : 0u);
+         g_scene_staged_dialogue_bounds[0] = g_scene_dialogue_bounds[0];
+@@ -2085,6 +2088,7 @@
+         g_scene_tiled_postprocess = 0;
+         g_scene_orb_after_postprocess = false;
+         g_scene_tiled_battle_effect = false;
++        g_scene_offscreen_light = false;
+         g_scene_red_hex_effect = false;
+         g_scene_dialogue_panel = false;
+     }
+@@ -3640,13 +3644,22 @@
+         (static_cast<std::uint32_t>(c.alpha) & 0xFFu) == 0x68u &&
+         ((c.alpha >> 32) & 0xFFu) == 0x80u &&
+         v[0].r <= 16u && v[0].g <= 32u && v[0].b <= 32u;
+-    if (enemy_glow || battle_light) {
+-        const int padding = enemy_glow ? 24 : 2;
+-        const std::uint32_t x0 = static_cast<std::uint32_t>(std::clamp(minx - padding, 0, 511));
+-        const std::uint32_t y0 = static_cast<std::uint32_t>(std::clamp(miny - padding, 0, 447));
+-        const std::uint32_t x1 = static_cast<std::uint32_t>(std::clamp(maxx + padding + 1, 0, 512));
+-        const std::uint32_t y1 = static_cast<std::uint32_t>(std::clamp(maxy + padding + 1, 0, 448));
+-        if (!g_scene_tiled_battle_effect) {
++    // The pink enemy and its faint ground light are drawn into a half-size
++    // offscreen target before the tiled copy. Track that source geometry in
++    // full-size screen coordinates so the finished GS light can be retained
++    // without replacing the whole high-resolution battle scene.
++    const bool offscreen_light = g_scene_geometry &&
++        (c.frame & 0x1FFu) == 0x150u && texture_base == 0x3B00u &&
++        ((c.tex0 >> 20) & 0x3Fu) == 0x13u;
++    if (offscreen_light) b.scene_fullscreen = true;
++    if (enemy_glow || battle_light || offscreen_light) {
++        const int padding = offscreen_light ? 72 : (enemy_glow ? 24 : 2);
++        const int scale = offscreen_light ? 2 : 1;
++        const std::uint32_t x0 = static_cast<std::uint32_t>(std::clamp(minx * scale - padding, 0, 511));
++        const std::uint32_t y0 = static_cast<std::uint32_t>(std::clamp(miny * scale - padding, 0, 447));
++        const std::uint32_t x1 = static_cast<std::uint32_t>(std::clamp((maxx + 1) * scale + padding, 0, 512));
++        const std::uint32_t y1 = static_cast<std::uint32_t>(std::clamp((maxy + 1) * scale + padding, 0, 448));
++        if (!g_scene_tiled_battle_effect && !g_scene_offscreen_light) {
+             g_scene_tiled_effect_bounds[0] = x0 | (y0 << 16);
+             g_scene_tiled_effect_bounds[1] = x1 | (y1 << 16);
+         } else {
+@@ -3654,7 +3667,8 @@
+             g_scene_tiled_effect_bounds[0] = std::min(x0, old0 & 0xFFFFu) | (std::min(y0, old0 >> 16) << 16);
+             g_scene_tiled_effect_bounds[1] = std::max(x1, old1 & 0xFFFFu) | (std::max(y1, old1 >> 16) << 16);
+         }
+-        g_scene_tiled_battle_effect = true;
++        g_scene_tiled_battle_effect |= enemy_glow || battle_light;
++        g_scene_offscreen_light |= offscreen_light;
+     }
+     if (g_scene_geometry && (c.frame & 0x1FFu) == 0x70u && logo_triangle &&
+         (prim == 3 || prim == 4 || prim == 5) && count >= 3 && (attr & 0x40u))
+@@ -4185,6 +4199,7 @@
+     g_scene_tiled_postprocess = 0;
+     g_scene_orb_after_postprocess = false;
+     g_scene_tiled_battle_effect = false;
++    g_scene_offscreen_light = false;
+     g_scene_red_hex_effect = false;
+     g_scene_dialogue_panel = false;
+     g_scene_dialogue_bounds[0] = g_scene_dialogue_bounds[1] = 0;
+@@ -4629,17 +4644,34 @@
+           any(abs(rgb(final_vram[word]) - rgb(before_hud[word])) > vec3<f32>(8.0 / 255.0))) {
+         return vec4<f32>(0.0);
+       }
+-      if ((params.snapshot_flags & 524288u) != 0u &&
++      var retained_light = 0.0;
++      if ((params.snapshot_flags & (524288u | 2097152u)) != 0u &&
+           x >= i32(params.tiled_xy0 & 65535u) && x < i32(params.tiled_xy1 & 65535u) &&
+           y >= i32(params.tiled_xy0 >> 16u) && y < i32(params.tiled_xy1 >> 16u)) {
+         let gs_light = rgb(before_hud[word]);
+         let gs_peak = max(gs_light.r, max(gs_light.g, gs_light.b));
+         let missing_light = gs_light - scene_pixel.rgb;
+         let excess = max(missing_light.r, max(missing_light.g, missing_light.b));
+-        let light_weight = clamp((gs_peak - 0.65) * 5.0, 0.0, 1.0) *
+-                           clamp((excess - 0.04) * 4.0, 0.0, 1.0);
++        let strong_weight = select(0.0,
++            clamp((gs_peak - 0.65) * 5.0, 0.0, 1.0) *
++            clamp((excess - 0.04) * 4.0, 0.0, 1.0),
++            (params.snapshot_flags & 524288u) != 0u);
++        let offscreen_weight = clamp((gs_peak - 0.26) * 3.5, 0.0, 1.0) *
++                               clamp((excess - 0.02) * 15.0, 0.0, 1.0);
++        let bx0 = i32(params.tiled_xy0 & 65535u);
++        let by0 = i32(params.tiled_xy0 >> 16u);
++        let bx1 = i32(params.tiled_xy1 & 65535u);
++        let by1 = i32(params.tiled_xy1 >> 16u);
++        let edge = min(min(x - bx0, bx1 - 1 - x), min(y - by0, by1 - 1 - y));
++        let feather = clamp(f32(edge) / 36.0, 0.0, 1.0);
++        let offscreen_enabled = (params.snapshot_flags & 2097152u) != 0u;
++        let light_weight = max(strong_weight,
++                               select(0.0, offscreen_weight * feather, offscreen_enabled));
+         if (light_weight > 0.0) {
+-          return vec4<f32>(scene_pixel.rgb, scene_coverage * (1.0 - light_weight));
++          if (!offscreen_enabled) {
++            return vec4<f32>(scene_pixel.rgb, scene_coverage * (1.0 - light_weight));
++          }
++          retained_light = light_weight;
+         }
+       }
+       if ((params.snapshot_flags & 1024u) != 0u) { return vec4<f32>(rgb(before_hud[word]), 1.0); }
+@@ -4672,8 +4704,9 @@
+         // The GS display beneath this pass already includes its HUD. Keep
+         // scene coverage so translucent or empty scene pixels do not replace
+         // that display with a second application of the HUD difference.
+-        return vec4<f32>(result, scene_coverage);
++        return vec4<f32>(result, scene_coverage * (1.0 - retained_light));
+       }
++      return vec4<f32>(scene_pixel.rgb, scene_coverage * (1.0 - retained_light));
+     }
+   }
+   return vec4<f32>(scene_pixel.rgb, scene_coverage);
+@@ -5085,6 +5118,7 @@
+         g_scene_tiled_postprocess = 0;
+         g_scene_orb_after_postprocess = false;
+         g_scene_tiled_battle_effect = false;
++        g_scene_offscreen_light = false;
+         g_scene_red_hex_effect = false;
+         g_scene_dialogue_panel = false;
+         if (reconfigure) configure_surface();

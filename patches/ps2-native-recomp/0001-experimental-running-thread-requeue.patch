@@ -1,0 +1,13 @@
+diff --git a/runtime/src/kernel.cpp b/runtime/src/kernel.cpp
+index 6561c4d..2120a29 100644
+--- a/runtime/src/kernel.cpp
++++ b/runtime/src/kernel.cpp
+@@ -600,7 +600,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
+         if (!t) { ret(c, -1); break; }
+         ret(c, t->priority);
+         t->priority = static_cast<int>(arg(c, 1)) & (kMaxPriority - 1);
+-        if (t->status == kReady) t->order = ++g_order;
++        if (t->status == kReady || (std::getenv("PS2_DEBUG_REQUEUE") && t->status == kRun)) t->order = ++g_order;
+         if (n == 0x29) reschedule(c);
+         else g_reschedule = true;
+         break;

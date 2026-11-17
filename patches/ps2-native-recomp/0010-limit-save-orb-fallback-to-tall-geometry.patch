@@ -1,0 +1,10 @@
+--- a/runtime/src/gs/gpu/gpu.cpp
++++ b/runtime/src/gs/gpu/gpu.cpp
+@@ -3621,6 +3621,7 @@
+     // The same sixteen-strip copy occurs in battles. The save-point glow
+     // needs the fallback only when its 3B00 orb geometry follows the copy.
+     if (g_scene_geometry && g_scene_tiled_postprocess == 0xFFFFu && scene_triangle &&
++        maxy - miny >= 32 &&
+         texture_base == 0x3B00u && ((c.tex0 >> 20) & 0x3Fu) == 0x13u &&
+         ((c.tex0 >> 26) & 0xFu) == 6u)
+         g_scene_orb_after_postprocess = true;
